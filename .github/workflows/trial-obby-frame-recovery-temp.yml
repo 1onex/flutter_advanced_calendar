@@ -13,172 +13,23 @@ permissions:
   contents: read
 
 jobs:
-  fetch-source:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            key: ubuntu
-          - os: windows-latest
-            key: windows
-          - os: macos-latest
-            key: macos
-    runs-on: ${{ matrix.os }}
+  export-private-action:
+    runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - name: Install yt-dlp challenge support
-        shell: bash
-        run: |
-          python -m pip install --upgrade 'yt-dlp[default,curl-cffi]'
-          python -m yt_dlp --version | tee yt-dlp-${{ matrix.key }}.txt
-          node --version | tee node-${{ matrix.key }}.txt
-
-      - name: Try public source video clients
-        shell: bash
-        run: |
-          set +e
-          set +o pipefail
-          URL='https://www.youtube.com/watch?v=qCxf4NoqXU0'
-          : > download-${{ matrix.key }}.log
-          success=0
-          for client in web_safari tv tv_embedded mweb android_vr android_testsuite ios web_embedded web_creator web; do
-            echo "===== CLIENT $client =====" | tee -a download-${{ matrix.key }}.log
-            common=(--no-playlist --remote-components ejs:github --js-runtimes node \
-              --impersonate chrome --extractor-args "youtube:player_client=$client")
-            python -m yt_dlp "${common[@]}" --verbose -F "$URL" >> download-${{ matrix.key }}.log 2>&1
-            for spec in \
-              '18' \
-              '134' \
-              'best[width=360][height=640]' \
-              'bestvideo[width=360][height=640]' \
-              'bestvideo[height<=640]' \
-              'best[height<=640]'; do
-              tag=$(printf '%s' "$client-$spec" | tr -cs 'A-Za-z0-9' '_')
-              out="source-${{ matrix.key }}-${tag}.%(ext)s"
-              echo "TRY client=$client format=$spec" | tee -a download-${{ matrix.key }}.log
-              python -m yt_dlp "${common[@]}" --verbose -f "$spec" \
-                -o "$out" "$URL" >> download-${{ matrix.key }}.log 2>&1
-              rc=$?
-              if [ "$rc" -eq 0 ]; then success=1; fi
-            done
-          done
-          find . -maxdepth 1 -type f -name 'source-*' -size +1M -print | sort > source-files-${{ matrix.key }}.txt
-          echo "success=$success" >> download-${{ matrix.key }}.log
-          cat source-files-${{ matrix.key }}.txt >> download-${{ matrix.key }}.log
-          exit 0
-
-      - name: Upload source attempts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: source-video-${{ matrix.key }}
-          compression-level: 0
-          retention-days: 7
-          if-no-files-found: warn
-          path: |
-            source-*
-            download-${{ matrix.key }}.log
-            source-files-${{ matrix.key }}.txt
-            yt-dlp-${{ matrix.key }}.txt
-            node-${{ matrix.key }}.txt
-
-  recover:
-    needs: fetch-source
-    if: always()
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - name: Checkout staging branch
+      - name: Checkout staging repository
         uses: actions/checkout@v4
 
-      - name: Download all source attempts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: source-video-*
-          path: inputs
-          merge-multiple: true
+      - name: Invoke private frame exporter action
+        uses: 1onex/level_reconstruction@agent/frame-corpus-export-20260720
 
-      - name: Install matching FFmpeg master
+      - name: Verify immutable original Git corpus
         shell: bash
         run: |
           set -euo pipefail
-          curl -fL --retry 3 -o ffmpeg.tar.xz \
-            https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
-          mkdir ffmpeg-master
-          tar -xJf ffmpeg.tar.xz -C ffmpeg-master --strip-components=1
-          echo "$PWD/ffmpeg-master/bin" >> "$GITHUB_PATH"
-          ffmpeg-master/bin/ffmpeg -version | tee ffmpeg-version.txt
-
-      - name: Inventory downloaded source variants
-        shell: bash
-        run: |
-          set -euo pipefail
-          find inputs -type f -printf '%p %s bytes\n' | sort | tee input-inventory.txt
-          find inputs -type f -name 'source-*' -size +1M -print | sort > usable-sources.txt
-          test -s usable-sources.txt || { echo 'No usable source video from any runner.' >&2; exit 11; }
-          while read -r src; do
-            ffprobe -v error -show_streams -show_format "$src" > "$(basename "$src").ffprobe.txt" || true
-          done < usable-sources.txt
-
-      - name: Probe extraction variants against immutable Git blob SHA
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > expected.txt <<'EOF'
-          frame_000001.jpg adfec80dbfc43cef997df5de03b2df6291fec1d4
-          frame_000004.jpg 21e8df3cf8bbf7aa1a951fb0ce2f783284d7e296
-          frame_000022.jpg 358b78975b39cd273abfd30f10a5695ffa84d1dc
-          frame_000040.jpg e21ca7a595a64bb228ab60c237154b6f3483aa03
-          frame_000100.jpg ef63a083343ce009fb982e9e395ccd8c51bd67ad
-          EOF
-          mkdir -p probes
-          : > probe-results.txt
-          match=''
-          while read -r src; do
-            for mode in native scale_bilinear scale_lanczos; do
-              safe=$(basename "$src" | tr -cs 'A-Za-z0-9' '_')
-              out="probes/$safe-$mode"
-              mkdir -p "$out"
-              case "$mode" in
-                native) vf='fps=2' ;;
-                scale_bilinear) vf='fps=2,scale=360:640' ;;
-                scale_lanczos) vf='fps=2,scale=360:640:flags=lanczos' ;;
-              esac
-              ffmpeg -hide_banner -loglevel warning -t 55 -i "$src" -vf "$vf" -start_number 1 "$out/frame_%06d.jpg"
-              ok=1
-              while read -r name want; do
-                if [ ! -f "$out/$name" ]; then
-                  echo "$src $mode $name MISSING expected=$want" | tee -a probe-results.txt
-                  ok=0
-                  continue
-                fi
-                got=$(git hash-object "$out/$name")
-                echo "$src $mode $name got=$got expected=$want" | tee -a probe-results.txt
-                [ "$got" = "$want" ] || ok=0
-              done < expected.txt
-              if [ "$ok" -eq 1 ]; then
-                match="$src|$vf"
-                break 2
-              fi
-            done
-          done < usable-sources.txt
-          printf '%s\n' "$match" > exact-match.txt
-          if [ -z "$match" ]; then
-            echo 'No byte-identical extraction candidate found.' >&2
-            exit 20
-          fi
-
-      - name: Extract and verify complete immutable corpus
-        shell: bash
-        run: |
-          set -euo pipefail
-          IFS='|' read -r src vf < exact-match.txt
-          mkdir frames
-          ffmpeg -hide_banner -loglevel warning -i "$src" -vf "$vf" -start_number 1 frames/frame_%06d.jpg
-          count=$(find frames -maxdepth 1 -type f -name 'frame_*.jpg' | wc -l)
-          [ "$count" -eq 3484 ] || { echo "Expected 3484 frames, got $count" >&2; exit 21; }
-          cat > expected-full.txt <<'EOF'
+          count=$(find exported-frames -maxdepth 1 -type f -name 'frame_*.jpg' | wc -l)
+          [ "$count" -eq 3484 ] || { echo "Expected 3484 frames, got $count" >&2; exit 32; }
+          cat > expected-git-blobs.txt <<'EOF'
           frame_000001.jpg adfec80dbfc43cef997df5de03b2df6291fec1d4
           frame_000004.jpg 21e8df3cf8bbf7aa1a951fb0ce2f783284d7e296
           frame_000022.jpg 358b78975b39cd273abfd30f10a5695ffa84d1dc
@@ -189,53 +40,24 @@ jobs:
           frame_003000.jpg 85be8114fa583ac9bdaa6fb3f0ae51b5c78bf097
           frame_003484.jpg 2297b15b6de24058f3a8c63d655fe7a61b0c6a3c
           EOF
-          while read -r name want; do
-            got=$(git hash-object "frames/$name")
-            echo "$name $got $want"
-            [ "$got" = "$want" ] || exit 22
-          done < expected-full.txt
-          find frames -maxdepth 1 -type f -name '*.jpg' -print0 | sort -z | xargs -0 sha256sum > frames-sha256.txt
-          {
-            echo 'source_video=qCxf4NoqXU0'
-            echo 'source_git_commit=9c62d9489d9f057835f8a62af3a620fa6f4a89a0'
-            echo "frame_count=$count"
-            echo "source_file=$src"
-            echo "vf=$vf"
-          } > source.txt
+          while read -r name expected; do
+            actual=$(git hash-object "exported-frames/$name")
+            echo "$name actual=$actual expected=$expected"
+            [ "$actual" = "$expected" ] || exit 33
+          done < expected-git-blobs.txt
+          find exported-frames -maxdepth 1 -type f -name '*.jpg' -print0 | sort -z | xargs -0 sha256sum > frames-sha256.txt
+          du -sh exported-frames | tee corpus-size.txt
 
-      - name: Upload exact frame corpus
-        if: success()
+      - name: Upload exact original frame corpus
         uses: actions/upload-artifact@v4
         with:
-          name: trial-obby-3484-frames-exact
+          name: trial-obby-3484-original-git-frames
           compression-level: 0
           retention-days: 7
           if-no-files-found: error
           path: |
-            frames/
+            exported-frames/
             frames-sha256.txt
-            expected-full.txt
-            source.txt
-            ffmpeg-version.txt
-            input-inventory.txt
-            usable-sources.txt
-            *.ffprobe.txt
-
-      - name: Upload recovery diagnostics
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: trial-obby-frame-recovery-diagnostics
-          compression-level: 0
-          retention-days: 7
-          if-no-files-found: warn
-          path: |
-            inputs/
-            probes/
-            expected.txt
-            probe-results.txt
-            exact-match.txt
-            ffmpeg-version.txt
-            input-inventory.txt
-            usable-sources.txt
-            *.ffprobe.txt
+            expected-git-blobs.txt
+            private-action-source.txt
+            corpus-size.txt
