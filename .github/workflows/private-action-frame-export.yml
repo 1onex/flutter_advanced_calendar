@@ -30,36 +30,45 @@ jobs:
           echo "$PWD/ffmpeg-master/bin" >> "$GITHUB_PATH"
           ffmpeg-master/bin/ffmpeg -version | tee ffmpeg-version.txt
 
-      - name: Follow Vyper fingerprint fallback to Piped JSON
+      - name: Follow Vyper-provided HTTP fingerprint fallback
         shell: bash
         run: |
-          set -euo pipefail
+          set +e
+          set +o pipefail
           VIDEO_ID='qCxf4NoqXU0'
           UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/138 Safari/537.36'
+          : > vyper-results.log
           curl -4 --http1.1 -sS -L --connect-timeout 10 --max-time 120 -A "$UA" \
-            "https://yapi.vyper.me/streams/$VIDEO_ID" -o vyper-entry.html
+            "https://yapi.vyper.me/streams/$VIDEO_ID" -o vyper-entry.html 2>>vyper-results.log
+          entry_rc=$?
+          echo "entry_rc=$entry_rc bytes=$(wc -c < vyper-entry.html 2>/dev/null || echo 0)" | tee -a vyper-results.log
           redirect=$(python - <<'PY'
           import re
           text=open('vyper-entry.html', encoding='utf-8', errors='ignore').read()
           m=re.search(r"redirect_link\s*=\s*'([^']+)'", text)
-          print((m.group(1) if m else '').replace('http://','https://'))
+          print(m.group(1) if m else '')
           PY
           )
-          test -n "$redirect" || { echo 'No Vyper redirect_link found'; exit 11; }
           printf '%s\n' "$redirect" > vyper-redirect.txt
+          if [ -z "$redirect" ]; then echo 'No Vyper redirect_link found' | tee -a vyper-results.log; exit 11; fi
+          success=0
           for fp in -7 -5 -3; do
             url="${redirect}fp=${fp}"
+            file="vyper-fp${fp#-}.json"
             echo "TRY $url" | tee -a vyper-results.log
-            curl -4 --http1.1 -sS -L --connect-timeout 10 --max-time 180 -A "$UA" \
-              -H 'Accept: application/json' "$url" -o "vyper-fp${fp#-}.json"
-            if jq -e '.videoStreams | type == "array" and length > 0' "vyper-fp${fp#-}.json" >/dev/null 2>&1; then
-              cp "vyper-fp${fp#-}.json" vyper-streams.json
+            curl -4 --http1.1 -sS -L --connect-timeout 10 --max-time 240 -A "$UA" \
+              -H 'Accept: application/json' -o "$file" -w 'http_code=%{http_code}\n' "$url" 2>>vyper-results.log | tee -a vyper-results.log
+            rc=${PIPESTATUS[0]}
+            echo "curl_rc=$rc bytes=$(wc -c < "$file" 2>/dev/null || echo 0)" | tee -a vyper-results.log
+            if jq -e '.videoStreams | type == "array" and length > 0' "$file" >/dev/null 2>&1; then
+              cp "$file" vyper-streams.json
+              success=1
               break
             fi
-            head -c 1000 "vyper-fp${fp#-}.json" | tee -a vyper-results.log
+            head -c 1200 "$file" 2>/dev/null | tee -a vyper-results.log
             echo | tee -a vyper-results.log
           done
-          test -f vyper-streams.json || { echo 'Vyper fallback did not return Piped JSON'; exit 12; }
+          [ "$success" -eq 1 ] || { echo 'Vyper fallback did not return Piped JSON' | tee -a vyper-results.log; exit 12; }
           echo "title=$(jq -r '.title // ""' vyper-streams.json) duration=$(jq -r '.duration // 0' vyper-streams.json) streams=$(jq '.videoStreams|length' vyper-streams.json)" | tee -a vyper-results.log
           jq -r '
             .videoStreams[]
@@ -83,7 +92,7 @@ jobs:
             index=$((index+1))
             out="sources/source-$(printf '%02d' "$index")-${quality}-$(printf '%s' "$codec" | tr -cs 'A-Za-z0-9' '_').mp4"
             echo "DOWNLOAD quality=$quality codec=$codec videoOnly=$video_only"
-            curl -4 --http1.1 -fL --connect-timeout 10 --retry 2 --max-time 1200 -A "$UA" -o "$out" "$url"
+            curl -fL --connect-timeout 10 --retry 2 --max-time 1200 -A "$UA" -o "$out" "$url"
             rc=$?
             if [ "$rc" -eq 0 ] && [ -f "$out" ] && [ "$(stat -c %s "$out")" -gt 1000000 ]; then
               printf '%s\t%s\t%s\t%s\n' "$out" "$quality" "$codec" "$video_only" >> downloaded-sources.tsv
