@@ -14,7 +14,7 @@ permissions:
 jobs:
   recover-piped:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 55
     steps:
       - name: Checkout staging repository
         uses: actions/checkout@v4
@@ -25,14 +25,13 @@ jobs:
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq jq
-          curl -fL --retry 3 -o ffmpeg.tar.xz \
-            https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
+          curl -fL --retry 3 -o ffmpeg.tar.xz https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
           mkdir ffmpeg-master
           tar -xJf ffmpeg.tar.xz -C ffmpeg-master --strip-components=1
           echo "$PWD/ffmpeg-master/bin" >> "$GITHUB_PATH"
           ffmpeg-master/bin/ffmpeg -version | tee ffmpeg-version.txt
 
-      - name: Query unauthenticated Piped stream APIs
+      - name: Query current non-CDN Piped APIs
         shell: bash
         run: |
           set +e
@@ -42,42 +41,61 @@ jobs:
           : > piped-results.log
           : > candidate-streams.tsv
           for api in \
-            'https://pipedapi.kavin.rocks' \
-            'https://pipedapi.tokhmi.xyz' \
-            'https://pipedapi.moomoo.me' \
-            'https://pipedapi.syncpundit.io' \
-            'https://api-piped.mha.fi' \
-            'https://piped-api.garudalinux.org'; do
+            'https://pa.il.ax' \
+            'https://piped-api.privacy.com.de' \
+            'https://api.piped.projectsegfau.lt' \
+            'https://pipedapi.in.projectsegfau.lt' \
+            'https://pipedapi.us.projectsegfau.lt' \
+            'https://watchapi.whatever.social' \
+            'https://api.piped.privacydev.net' \
+            'https://pipedapi.palveluntarjoaja.eu' \
+            'https://pipedapi.smnz.de' \
+            'https://pipedapi.adminforge.de' \
+            'https://pipedapi.qdi.fi' \
+            'https://piped-api.hostux.net' \
+            'https://pdapi.vern.cc' \
+            'https://pipedapi.pfcd.me' \
+            'https://pipedapi.frontendfriendly.xyz' \
+            'https://api.piped.yt' \
+            'https://pipedapi.astartes.nl' \
+            'https://pipedapi.osphost.fi' \
+            'https://pipedapi.simpleprivacy.fr' \
+            'https://pipedapi.drgns.space' \
+            'https://piapi.ggtyler.dev' \
+            'https://api.watch.pluto.lat' \
+            'https://piped-backend.seitan-ayoub.lol' \
+            'https://pipedapi.owo.si' \
+            'https://pipedapi-libre.kavin.rocks' \
+            'https://pipedapi.rivo.lol' \
+            'https://pipedapi.leptons.xyz'; do
             safe=$(printf '%s' "$api" | sed 's#https://##' | tr -cs 'A-Za-z0-9' '_')
             json="piped-${safe}.json"
             echo "===== $api =====" | tee -a piped-results.log
-            curl -sS --fail-with-body --max-time 90 -A "$UA" "$api/streams/$VIDEO_ID" > "$json"
+            curl -sS --fail-with-body --max-time 75 -A "$UA" "$api/streams/$VIDEO_ID" > "$json"
             rc=$?
-            echo "curl_rc=$rc bytes=$(wc -c < "$json" 2>/dev/null || echo 0)" | tee -a piped-results.log
+            bytes=$(wc -c < "$json" 2>/dev/null || echo 0)
+            echo "curl_rc=$rc bytes=$bytes" | tee -a piped-results.log
             if [ "$rc" -eq 0 ] && jq -e '.videoStreams | type == "array" and length > 0' "$json" >/dev/null 2>&1; then
+              title=$(jq -r '.title // ""' "$json")
+              duration=$(jq -r '.duration // 0' "$json")
+              streams=$(jq '.videoStreams | length' "$json")
+              echo "SUCCESS title=$title duration=$duration streams=$streams" | tee -a piped-results.log
               jq -r --arg api "$api" '
                 .videoStreams[]
                 | select((.mimeType // "") | startswith("video/mp4"))
-                | [
-                    $api,
-                    (.quality // "unknown"),
-                    (.codec // "unknown"),
-                    ((.videoOnly // false) | tostring),
-                    .url
-                  ]
+                | [$api, (.quality // "unknown"), (.codec // "unknown"), ((.videoOnly // false) | tostring), (.bitrate // 0 | tostring), .url]
                 | @tsv
               ' "$json" >> candidate-streams.tsv
-              echo "streams=$(jq '.videoStreams | length' "$json") title=$(jq -r '.title // ""' "$json")" | tee -a piped-results.log
             else
-              head -c 1000 "$json" | tee -a piped-results.log
+              head -c 500 "$json" | tr '\n' ' ' | tee -a piped-results.log
               echo | tee -a piped-results.log
             fi
           done
           sort -u candidate-streams.tsv -o candidate-streams.tsv
           cat candidate-streams.tsv | tee -a piped-results.log
-          test -s candidate-streams.tsv || { echo 'No Piped instance returned MP4 streams.' >&2; exit 11; }
+          test -s candidate-streams.tsv || { echo 'No Piped API returned MP4 streams.' >&2; exit 11; }
 
-      - name: Download candidate 360p/nearby streams
+      - name: Download likely 360p source candidates
         shell: bash
         run: |
           set +e
@@ -86,14 +104,15 @@ jobs:
           mkdir sources
           : > downloaded-sources.tsv
           index=0
-          while IFS=$'\t' read -r api quality codec video_only url; do
+          while IFS=$'\t' read -r api quality codec video_only bitrate url; do
             case "$quality" in
-              240p|360p|480p|720p|360|480|720) ;;
+              240p|360p|480p|720p|240|360|480|720) ;;
               *) continue ;;
             esac
             index=$((index+1))
-            out="sources/source-$(printf '%02d' "$index")-${quality}-${codec}.mp4"
-            echo "DOWNLOAD $quality $codec videoOnly=$video_only from $api"
+            safe=$(printf '%s-%s-%s' "$api" "$quality" "$codec" | tr -cs 'A-Za-z0-9' '_')
+            out="sources/source-$(printf '%02d' "$index")-${safe}.mp4"
+            echo "DOWNLOAD api=$api quality=$quality codec=$codec videoOnly=$video_only bitrate=$bitrate"
             curl -fL --retry 2 --max-time 1200 -A "$UA" -o "$out" "$url"
             rc=$?
             if [ "$rc" -eq 0 ] && [ -f "$out" ] && [ "$(stat -c %s "$out")" -gt 1000000 ]; then
@@ -104,7 +123,7 @@ jobs:
             [ "$(wc -l < downloaded-sources.tsv)" -ge 8 ] && break
           done < candidate-streams.tsv
           cat downloaded-sources.tsv
-          test -s downloaded-sources.tsv || { echo 'Piped returned metadata but no stream could be downloaded.' >&2; exit 12; }
+          test -s downloaded-sources.tsv || { echo 'Metadata existed, but no source stream downloaded.' >&2; exit 12; }
 
       - name: Probe exact extraction against immutable Git blobs
         shell: bash
@@ -121,9 +140,9 @@ jobs:
           : > probe-results.txt
           match=''
           while IFS=$'\t' read -r src api quality codec video_only; do
-            ffprobe -v error -show_streams -show_format "$src" > "${src##*/}.ffprobe.txt" || continue
+            ffprobe -v error -show_streams -show_format "$src" > "$(basename "$src").ffprobe.txt" || continue
             for vf in 'fps=2' 'fps=2,scale=360:640' 'fps=2,scale=360:640:flags=lanczos'; do
-              safe=$(printf '%s-%s' "${src##*/}" "$vf" | tr -cs 'A-Za-z0-9' '_')
+              safe=$(printf '%s-%s' "$(basename "$src")" "$vf" | tr -cs 'A-Za-z0-9' '_')
               out="probes/$safe"
               mkdir -p "$out"
               ffmpeg -hide_banner -loglevel warning -t 55 -i "$src" -vf "$vf" -start_number 1 "$out/frame_%06d.jpg"
@@ -137,7 +156,7 @@ jobs:
             done
           done < downloaded-sources.tsv
           printf '%s\n' "$match" > exact-match.txt
-          test -n "$match" || { echo 'Piped streams downloaded, but none reproduces the immutable Git JPEGs.' >&2; exit 20; }
+          test -n "$match" || { echo 'Downloaded streams did not reproduce Git JPEGs.' >&2; exit 20; }
 
       - name: Extract and verify full corpus
         shell: bash
