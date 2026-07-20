@@ -1,4 +1,4 @@
-name: Temporary Piped source recovery
+name: Temporary Piped live-instance recovery
 
 on:
   push:
@@ -12,12 +12,11 @@ permissions:
   contents: read
 
 jobs:
-  recover-piped:
+  recover-piped-live:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 40
     steps:
-      - name: Checkout staging repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Install matching FFmpeg and jq
         shell: bash
@@ -31,57 +30,33 @@ jobs:
           echo "$PWD/ffmpeg-master/bin" >> "$GITHUB_PATH"
           ffmpeg-master/bin/ffmpeg -version | tee ffmpeg-version.txt
 
-      - name: Query Piped APIs in parallel
+      - name: Query currently live Piped APIs
         shell: bash
         run: |
-          set -euo pipefail
-          cat > piped-hosts.txt <<'EOF'
-          https://pa.il.ax
-          https://piped-api.privacy.com.de
-          https://api.piped.projectsegfau.lt
-          https://pipedapi.in.projectsegfau.lt
-          https://pipedapi.us.projectsegfau.lt
-          https://watchapi.whatever.social
-          https://api.piped.privacydev.net
-          https://pipedapi.palveluntarjoaja.eu
-          https://pipedapi.smnz.de
-          https://pipedapi.adminforge.de
-          https://pipedapi.qdi.fi
-          https://piped-api.hostux.net
-          https://pdapi.vern.cc
-          https://pipedapi.pfcd.me
-          https://pipedapi.frontendfriendly.xyz
-          https://api.piped.yt
-          https://pipedapi.astartes.nl
-          https://pipedapi.osphost.fi
-          https://pipedapi.simpleprivacy.fr
-          https://pipedapi.drgns.space
-          https://piapi.ggtyler.dev
-          https://api.watch.pluto.lat
-          https://piped-backend.seitan-ayoub.lol
-          https://pipedapi.owo.si
-          https://pipedapi-libre.kavin.rocks
-          https://pipedapi.rivo.lol
-          https://pipedapi.leptons.xyz
-          EOF
-          mkdir responses
-          export VIDEO_ID='qCxf4NoqXU0'
-          export UA='TrialObbyCorpusRecovery/1.0 (+https://github.com/1onex/flutter_advanced_calendar/pull/1)'
-          cat piped-hosts.txt | xargs -P 16 -I{} bash -c '
-            api="$1"
-            safe=$(printf "%s" "$api" | sed "s#https://##" | tr -cs "A-Za-z0-9" "_")
-            code=$(curl -sS -L --connect-timeout 5 --max-time 25 -A "$UA" -o "responses/$safe.json" -w "%{http_code}" "$api/streams/$VIDEO_ID" || true)
-            printf "%s\t%s\t%s\n" "$api" "$code" "$(wc -c < "responses/$safe.json" 2>/dev/null || echo 0)" > "responses/$safe.status"
-          ' _ {}
-          cat responses/*.status | sort | tee piped-status.tsv
+          set +e
+          set +o pipefail
+          VIDEO_ID='qCxf4NoqXU0'
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/138 Safari/537.36'
           : > candidate-streams.tsv
-          : > piped-results.log
-          while IFS=$'\t' read -r api code bytes; do
+          : > piped-live-results.log
+          for api in \
+            'https://piped-api.lunar.icu' \
+            'https://yapi.vyper.me' \
+            'https://api.looleh.xyz' \
+            'https://pipedapi.nosebs.ru' \
+            'https://pa.il.ax' \
+            'https://pipedapi-libre.kavin.rocks' \
+            'https://pipedapi.kavin.rocks'; do
             safe=$(printf '%s' "$api" | sed 's#https://##' | tr -cs 'A-Za-z0-9' '_')
-            json="responses/$safe.json"
-            echo "===== $api code=$code bytes=$bytes =====" | tee -a piped-results.log
-            if jq -e '.videoStreams | type == "array" and length > 0' "$json" >/dev/null 2>&1; then
-              echo "SUCCESS title=$(jq -r '.title // ""' "$json") duration=$(jq -r '.duration // 0' "$json") streams=$(jq '.videoStreams|length' "$json")" | tee -a piped-results.log
+            json="piped-${safe}.json"
+            echo "===== $api =====" | tee -a piped-live-results.log
+            curl -4 --http1.1 -sS -L --fail-with-body --connect-timeout 8 --max-time 120 \
+              -A "$UA" -H 'Accept: application/json' "$api/streams/$VIDEO_ID" > "$json"
+            rc=$?
+            bytes=$(wc -c < "$json" 2>/dev/null || echo 0)
+            echo "rc=$rc bytes=$bytes" | tee -a piped-live-results.log
+            if [ "$rc" -eq 0 ] && jq -e '.videoStreams | type == "array" and length > 0' "$json" >/dev/null 2>&1; then
+              echo "SUCCESS title=$(jq -r '.title // ""' "$json") duration=$(jq -r '.duration // 0' "$json") streams=$(jq '.videoStreams|length' "$json")" | tee -a piped-live-results.log
               jq -r --arg api "$api" '
                 .videoStreams[]
                 | select((.mimeType // "") | startswith("video/mp4"))
@@ -89,43 +64,42 @@ jobs:
                 | @tsv
               ' "$json" >> candidate-streams.tsv
             else
-              head -c 300 "$json" | tr '\n' ' ' | tee -a piped-results.log
-              echo | tee -a piped-results.log
+              head -c 800 "$json" | tr '\n' ' ' | tee -a piped-live-results.log
+              echo | tee -a piped-live-results.log
             fi
-          done < piped-status.tsv
+          done
           sort -u candidate-streams.tsv -o candidate-streams.tsv
-          cat candidate-streams.tsv | tee -a piped-results.log
-          test -s candidate-streams.tsv || { echo 'No Piped API returned MP4 streams.' >&2; exit 11; }
+          cat candidate-streams.tsv | tee -a piped-live-results.log
+          test -s candidate-streams.tsv || { echo 'No live Piped API returned MP4 streams.' >&2; exit 11; }
 
-      - name: Download prioritized source candidates
+      - name: Download likely source candidates
         shell: bash
         run: |
           set +e
           set +o pipefail
-          UA='TrialObbyCorpusRecovery/1.0 (+https://github.com/1onex/flutter_advanced_calendar/pull/1)'
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/138 Safari/537.36'
           mkdir sources
           : > downloaded-sources.tsv
-          awk -F '\t' '$2 ~ /^(360p|360|480p|480|240p|240|720p|720)$/ {priority=9; if ($2 ~ /^360/) priority=1; else if ($2 ~ /^480/) priority=2; else if ($2 ~ /^240/) priority=3; if (tolower($3) ~ /(h264|avc)/) priority-=0.5; print priority "\t" $0}' candidate-streams.tsv | sort -n -k1,1 | cut -f2- > prioritized-streams.tsv
+          awk -F '\t' '$2 ~ /^(240p|360p|480p|720p|240|360|480|720)$/ {p=9; if ($2 ~ /^360/) p=1; else if ($2 ~ /^480/) p=2; else if ($2 ~ /^240/) p=3; if (tolower($3) ~ /(h264|avc)/) p-=0.5; print p "\t" $0}' candidate-streams.tsv | sort -n -k1,1 | cut -f2- > prioritized-streams.tsv
           index=0
           while IFS=$'\t' read -r api quality codec video_only bitrate url; do
             index=$((index+1))
-            safe=$(printf '%s-%s-%s' "$api" "$quality" "$codec" | tr -cs 'A-Za-z0-9' '_')
-            out="sources/source-$(printf '%02d' "$index")-${safe}.mp4"
-            echo "DOWNLOAD api=$api quality=$quality codec=$codec videoOnly=$video_only bitrate=$bitrate"
-            curl -fL --connect-timeout 10 --retry 2 --max-time 900 -A "$UA" -o "$out" "$url"
+            out="sources/source-$(printf '%02d' "$index")-${quality}-$(printf '%s' "$codec" | tr -cs 'A-Za-z0-9' '_').mp4"
+            echo "DOWNLOAD $api $quality $codec videoOnly=$video_only"
+            curl -4 --http1.1 -fL --connect-timeout 10 --retry 2 --max-time 1200 -A "$UA" -o "$out" "$url"
             rc=$?
             if [ "$rc" -eq 0 ] && [ -f "$out" ] && [ "$(stat -c %s "$out")" -gt 1000000 ]; then
               printf '%s\t%s\t%s\t%s\t%s\n' "$out" "$api" "$quality" "$codec" "$video_only" >> downloaded-sources.tsv
             else
               rm -f "$out"
             fi
-            [ "$(wc -l < downloaded-sources.tsv)" -ge 6 ] && break
-            [ "$index" -ge 14 ] && break
+            [ "$(wc -l < downloaded-sources.tsv)" -ge 8 ] && break
+            [ "$index" -ge 16 ] && break
           done < prioritized-streams.tsv
           cat downloaded-sources.tsv
-          test -s downloaded-sources.tsv || { echo 'No candidate stream downloaded.' >&2; exit 12; }
+          test -s downloaded-sources.tsv || { echo 'No Piped source URL downloaded.' >&2; exit 12; }
 
-      - name: Probe exact extraction against immutable Git blobs
+      - name: Probe exact immutable frames
         shell: bash
         run: |
           set -euo pipefail
@@ -155,9 +129,9 @@ jobs:
             done
           done < downloaded-sources.tsv
           printf '%s\n' "$match" > exact-match.txt
-          test -n "$match" || { echo 'Downloaded streams did not reproduce Git JPEGs.' >&2; exit 20; }
+          test -n "$match" || { echo 'Sources downloaded but did not reproduce Git blobs.' >&2; exit 20; }
 
-      - name: Extract and verify full corpus
+      - name: Extract and verify all 3484 frames
         shell: bash
         run: |
           set -euo pipefail
@@ -189,7 +163,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: trial-obby-3484-frames-exact-piped
+          name: trial-obby-3484-frames-exact-piped-live
           compression-level: 0
           retention-days: 7
           if-no-files-found: error
@@ -199,10 +173,10 @@ jobs:
             expected-full.txt
             source.txt
             ffmpeg-version.txt
-            piped-status.tsv
             candidate-streams.tsv
+            prioritized-streams.tsv
             downloaded-sources.tsv
-            piped-results.log
+            piped-live-results.log
             source-*.ffprobe.txt
             probe-results.txt
 
@@ -210,18 +184,16 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: trial-obby-piped-recovery-diagnostics
+          name: trial-obby-piped-live-diagnostics
           compression-level: 0
           retention-days: 7
           if-no-files-found: warn
           path: |
-            responses/
-            piped-hosts.txt
-            piped-status.tsv
+            piped-*.json
             candidate-streams.tsv
             prioritized-streams.tsv
             downloaded-sources.tsv
-            piped-results.log
+            piped-live-results.log
             sources/
             source-*.ffprobe.txt
             probes/
