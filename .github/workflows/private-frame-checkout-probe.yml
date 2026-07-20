@@ -1,0 +1,55 @@
+name: Temporary private frame checkout probe
+
+on:
+  push:
+    branches:
+      - agent/trial-obby-frame-export-test
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Probe private repository with current workflow token
+        id: probe
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: 1onex/level_reconstruction
+          ref: 9c62d9489d9f057835f8a62af3a620fa6f4a89a0
+          token: ${{ github.token }}
+          path: private-source
+          fetch-depth: 1
+          lfs: false
+
+      - name: Record result and package exact frames if access is granted
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "checkout_outcome=${{ steps.probe.outcome }}" | tee probe-result.txt
+          if [ -d private-source/frames ]; then
+            count=$(find private-source/frames -maxdepth 1 -type f -name '*.jpg' | wc -l)
+            echo "frame_count=$count" | tee -a probe-result.txt
+            [ "$count" -eq 3484 ]
+            cp -a private-source/frames .
+            find frames -maxdepth 1 -type f -name '*.jpg' -print0 | sort -z | xargs -0 sha256sum > frames-sha256.txt
+          fi
+
+      - name: Upload probe evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: private-frame-checkout-probe
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            probe-result.txt
+            frames/
+            frames-sha256.txt
