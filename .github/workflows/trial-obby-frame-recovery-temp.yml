@@ -1,0 +1,170 @@
+name: Temporary Trial Obby frame recovery
+
+on:
+  push:
+    branches:
+      - agent/trial-obby-frame-export-test
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout staging branch
+        uses: actions/checkout@v4
+
+      - name: Install current yt-dlp and FFmpeg master
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade yt-dlp
+          curl -fL --retry 3 -o ffmpeg.tar.xz \
+            https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
+          mkdir ffmpeg-master
+          tar -xJf ffmpeg.tar.xz -C ffmpeg-master --strip-components=1
+          echo "$PWD/ffmpeg-master/bin" >> "$GITHUB_PATH"
+          ffmpeg-master/bin/ffmpeg -version | tee ffmpeg-version.txt
+          yt-dlp --version | tee yt-dlp-version.txt
+
+      - name: Download source video variants
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL='https://www.youtube.com/watch?v=qCxf4NoqXU0'
+          yt-dlp -F "$URL" | tee formats.txt
+          yt-dlp --no-playlist -f '18/best[width=360][height=640]/best[height<=640]' \
+            --merge-output-format mp4 -o source-360.%(ext)s "$URL"
+          yt-dlp --no-playlist -f 'bestvideo[width=360][height=640]+bestaudio/bestvideo[height<=640]+bestaudio/best[height<=640]' \
+            --merge-output-format mp4 -o source-best.%(ext)s "$URL"
+          ls -lh source-* | tee source-files.txt
+          ffprobe -v error -show_streams -show_format source-360.* > source-360.ffprobe.txt
+          ffprobe -v error -show_streams -show_format source-best.* > source-best.ffprobe.txt
+
+      - name: Probe extraction variants against immutable Git blob SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > expected.txt <<'EOF'
+          frame_000001.jpg adfec80dbfc43cef997df5de03b2df6291fec1d4
+          frame_000004.jpg 21e8df3cf8bbf7aa1a951fb0ce2f783284d7e296
+          frame_000022.jpg 358b78975b39cd273abfd30f10a5695ffa84d1dc
+          frame_000040.jpg e21ca7a595a64bb228ab60c237154b6f3483aa03
+          frame_000100.jpg ef63a083343ce009fb982e9e395ccd8c51bd67ad
+          EOF
+
+          mkdir -p probes
+          : > probe-results.txt
+          match=''
+          for src in source-360.* source-best.*; do
+            [ -f "$src" ] || continue
+            for mode in native scale_bilinear scale_lanczos; do
+              out="probes/$(basename "$src")-$mode"
+              mkdir -p "$out"
+              case "$mode" in
+                native) vf='fps=2' ;;
+                scale_bilinear) vf='fps=2,scale=360:640' ;;
+                scale_lanczos) vf='fps=2,scale=360:640:flags=lanczos' ;;
+              esac
+              ffmpeg -hide_banner -loglevel warning -t 55 -i "$src" -vf "$vf" -start_number 1 "$out/frame_%06d.jpg"
+              ok=1
+              while read -r name want; do
+                if [ ! -f "$out/$name" ]; then
+                  echo "$src $mode $name MISSING expected=$want" | tee -a probe-results.txt
+                  ok=0
+                  continue
+                fi
+                got=$(git hash-object "$out/$name")
+                echo "$src $mode $name got=$got expected=$want" | tee -a probe-results.txt
+                [ "$got" = "$want" ] || ok=0
+              done < expected.txt
+              if [ "$ok" -eq 1 ]; then
+                match="$src|$vf"
+                break 2
+              fi
+            done
+          done
+          printf '%s\n' "$match" > exact-match.txt
+          if [ -z "$match" ]; then
+            echo 'No byte-identical extraction candidate found.' >&2
+            exit 20
+          fi
+
+      - name: Extract and verify complete immutable corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          IFS='|' read -r src vf < exact-match.txt
+          mkdir frames
+          ffmpeg -hide_banner -loglevel warning -i "$src" -vf "$vf" -start_number 1 frames/frame_%06d.jpg
+          count=$(find frames -maxdepth 1 -type f -name 'frame_*.jpg' | wc -l)
+          [ "$count" -eq 3484 ] || { echo "Expected 3484 frames, got $count" >&2; exit 21; }
+          cat > expected-full.txt <<'EOF'
+          frame_000001.jpg adfec80dbfc43cef997df5de03b2df6291fec1d4
+          frame_000004.jpg 21e8df3cf8bbf7aa1a951fb0ce2f783284d7e296
+          frame_000022.jpg 358b78975b39cd273abfd30f10a5695ffa84d1dc
+          frame_000040.jpg e21ca7a595a64bb228ab60c237154b6f3483aa03
+          frame_000100.jpg ef63a083343ce009fb982e9e395ccd8c51bd67ad
+          frame_001000.jpg 470e4d441726615196b08f4fbfe3a03f5a8f79a9
+          frame_002000.jpg ba6879062f85cf2bbcd6fdece8df21f94e5cf1b3
+          frame_003000.jpg 85be8114fa583ac9bdaa6fb3f0ae51b5c78bf097
+          frame_003484.jpg 2297b15b6de24058f3a8c63d655fe7a61b0c6a3c
+          EOF
+          while read -r name want; do
+            got=$(git hash-object "frames/$name")
+            echo "$name $got $want"
+            [ "$got" = "$want" ] || exit 22
+          done < expected-full.txt
+          find frames -maxdepth 1 -type f -name '*.jpg' -print0 | sort -z | xargs -0 sha256sum > frames-sha256.txt
+          {
+            echo 'source_video=qCxf4NoqXU0'
+            echo 'source_git_commit=9c62d9489d9f057835f8a62af3a620fa6f4a89a0'
+            echo "frame_count=$count"
+            echo "source_file=$src"
+            echo "vf=$vf"
+          } > source.txt
+
+      - name: Upload exact frame corpus
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trial-obby-3484-frames-exact
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            frames/
+            frames-sha256.txt
+            expected-full.txt
+            source.txt
+            ffmpeg-version.txt
+            yt-dlp-version.txt
+            formats.txt
+            source-360.ffprobe.txt
+            source-best.ffprobe.txt
+
+      - name: Upload recovery diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trial-obby-frame-recovery-diagnostics
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            probes/
+            expected.txt
+            probe-results.txt
+            exact-match.txt
+            ffmpeg-version.txt
+            yt-dlp-version.txt
+            formats.txt
+            source-files.txt
+            source-360.ffprobe.txt
+            source-best.ffprobe.txt
