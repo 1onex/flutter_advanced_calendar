@@ -20,11 +20,11 @@ jobs:
       - name: Checkout staging branch
         uses: actions/checkout@v4
 
-      - name: Install current yt-dlp and FFmpeg master
+      - name: Install yt-dlp challenge support and matching FFmpeg master
         shell: bash
         run: |
           set -euo pipefail
-          python -m pip install --upgrade yt-dlp
+          python -m pip install --upgrade 'yt-dlp[default,curl-cffi]'
           curl -fL --retry 3 -o ffmpeg.tar.xz \
             https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
           mkdir ffmpeg-master
@@ -32,20 +32,45 @@ jobs:
           echo "$PWD/ffmpeg-master/bin" >> "$GITHUB_PATH"
           ffmpeg-master/bin/ffmpeg -version | tee ffmpeg-version.txt
           yt-dlp --version | tee yt-dlp-version.txt
+          node --version | tee node-version.txt
 
-      - name: Download source video variants
+      - name: Download source video through resilient YouTube clients
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
           URL='https://www.youtube.com/watch?v=qCxf4NoqXU0'
-          yt-dlp -F "$URL" | tee formats.txt
-          yt-dlp --no-playlist -f '18/best[width=360][height=640]/best[height<=640]' \
-            --merge-output-format mp4 -o source-360.%(ext)s "$URL"
-          yt-dlp --no-playlist -f 'bestvideo[width=360][height=640]+bestaudio/bestvideo[height<=640]+bestaudio/best[height<=640]' \
-            --merge-output-format mp4 -o source-best.%(ext)s "$URL"
-          ls -lh source-* | tee source-files.txt
-          ffprobe -v error -show_streams -show_format source-360.* > source-360.ffprobe.txt
-          ffprobe -v error -show_streams -show_format source-best.* > source-best.ffprobe.txt
+          : > download.log
+          : > formats.txt
+          success=0
+          for client in web_safari tv mweb android_vr web; do
+            echo "===== CLIENT $client =====" | tee -a download.log
+            common=(--no-playlist --remote-components ejs:github --js-runtimes node \
+              --impersonate chrome --extractor-args "youtube:player_client=$client")
+            yt-dlp "${common[@]}" --verbose -F "$URL" 2>&1 | tee -a download.log | tee -a formats.txt
+            for spec in \
+              '18' \
+              'best[width=360][height=640]' \
+              'bestvideo[width=360][height=640]+bestaudio' \
+              'best[height<=640]'; do
+              tag=$(printf '%s' "$client-$spec" | tr -cs 'A-Za-z0-9' '_')
+              out="source-${tag}.%(ext)s"
+              echo "TRY client=$client format=$spec" | tee -a download.log
+              if yt-dlp "${common[@]}" --verbose -f "$spec" --merge-output-format mp4 \
+                -o "$out" "$URL" 2>&1 | tee -a download.log; then
+                success=1
+              fi
+            done
+          done
+          find . -maxdepth 1 -type f -name 'source-*' -size +1M -printf '%f %s bytes\n' | sort | tee source-files.txt
+          if [ "$success" -ne 1 ] || ! find . -maxdepth 1 -type f -name 'source-*' -size +1M | grep -q .; then
+            echo 'No source video variant downloaded.' | tee -a download.log
+            exit 11
+          fi
+          for src in source-*; do
+            [ -f "$src" ] || continue
+            [ "$(stat -c %s "$src")" -gt 1000000 ] || continue
+            ffprobe -v error -show_streams -show_format "$src" > "$src.ffprobe.txt" || true
+          done
 
       - name: Probe extraction variants against immutable Git blob SHA
         shell: bash
@@ -58,12 +83,13 @@ jobs:
           frame_000040.jpg e21ca7a595a64bb228ab60c237154b6f3483aa03
           frame_000100.jpg ef63a083343ce009fb982e9e395ccd8c51bd67ad
           EOF
-
           mkdir -p probes
           : > probe-results.txt
           match=''
-          for src in source-360.* source-best.*; do
+          for src in source-*; do
             [ -f "$src" ] || continue
+            [ "$(stat -c %s "$src")" -gt 1000000 ] || continue
+            case "$src" in *.ffprobe.txt) continue ;; esac
             for mode in native scale_bilinear scale_lanczos; do
               out="probes/$(basename "$src")-$mode"
               mkdir -p "$out"
@@ -145,9 +171,10 @@ jobs:
             source.txt
             ffmpeg-version.txt
             yt-dlp-version.txt
+            node-version.txt
             formats.txt
-            source-360.ffprobe.txt
-            source-best.ffprobe.txt
+            source-files.txt
+            source-*.ffprobe.txt
 
       - name: Upload recovery diagnostics
         if: failure()
@@ -164,7 +191,8 @@ jobs:
             exact-match.txt
             ffmpeg-version.txt
             yt-dlp-version.txt
+            node-version.txt
             formats.txt
+            download.log
             source-files.txt
-            source-360.ffprobe.txt
-            source-best.ffprobe.txt
+            source-*.ffprobe.txt
