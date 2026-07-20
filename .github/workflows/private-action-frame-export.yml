@@ -1,4 +1,4 @@
-name: Temporary private-action frame export
+name: Temporary Piped source recovery
 
 on:
   push:
@@ -12,23 +12,143 @@ permissions:
   contents: read
 
 jobs:
-  export:
+  recover-piped:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - name: Checkout staging repository
         uses: actions/checkout@v4
 
-      - name: Invoke private frame exporter action
-        uses: 1onex/level_reconstruction@agent/frame-corpus-export-20260720
-
-      - name: Verify immutable corpus
+      - name: Install matching FFmpeg and jq
         shell: bash
         run: |
           set -euo pipefail
-          count=$(find exported-frames -maxdepth 1 -type f -name 'frame_*.jpg' | wc -l)
-          [ "$count" -eq 3484 ] || { echo "Expected 3484 frames, got $count" >&2; exit 32; }
-          cat > expected-git-blobs.txt <<'EOF'
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq
+          curl -fL --retry 3 -o ffmpeg.tar.xz \
+            https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
+          mkdir ffmpeg-master
+          tar -xJf ffmpeg.tar.xz -C ffmpeg-master --strip-components=1
+          echo "$PWD/ffmpeg-master/bin" >> "$GITHUB_PATH"
+          ffmpeg-master/bin/ffmpeg -version | tee ffmpeg-version.txt
+
+      - name: Query unauthenticated Piped stream APIs
+        shell: bash
+        run: |
+          set +e
+          set +o pipefail
+          VIDEO_ID='qCxf4NoqXU0'
+          UA='TrialObbyCorpusRecovery/1.0 (+https://github.com/1onex/flutter_advanced_calendar/pull/1)'
+          : > piped-results.log
+          : > candidate-streams.tsv
+          for api in \
+            'https://pipedapi.kavin.rocks' \
+            'https://pipedapi.tokhmi.xyz' \
+            'https://pipedapi.moomoo.me' \
+            'https://pipedapi.syncpundit.io' \
+            'https://api-piped.mha.fi' \
+            'https://piped-api.garudalinux.org'; do
+            safe=$(printf '%s' "$api" | sed 's#https://##' | tr -cs 'A-Za-z0-9' '_')
+            json="piped-${safe}.json"
+            echo "===== $api =====" | tee -a piped-results.log
+            curl -sS --fail-with-body --max-time 90 -A "$UA" "$api/streams/$VIDEO_ID" > "$json"
+            rc=$?
+            echo "curl_rc=$rc bytes=$(wc -c < "$json" 2>/dev/null || echo 0)" | tee -a piped-results.log
+            if [ "$rc" -eq 0 ] && jq -e '.videoStreams | type == "array" and length > 0' "$json" >/dev/null 2>&1; then
+              jq -r --arg api "$api" '
+                .videoStreams[]
+                | select((.mimeType // "") | startswith("video/mp4"))
+                | [
+                    $api,
+                    (.quality // "unknown"),
+                    (.codec // "unknown"),
+                    ((.videoOnly // false) | tostring),
+                    .url
+                  ]
+                | @tsv
+              ' "$json" >> candidate-streams.tsv
+              echo "streams=$(jq '.videoStreams | length' "$json") title=$(jq -r '.title // ""' "$json")" | tee -a piped-results.log
+            else
+              head -c 1000 "$json" | tee -a piped-results.log
+              echo | tee -a piped-results.log
+            fi
+          done
+          sort -u candidate-streams.tsv -o candidate-streams.tsv
+          cat candidate-streams.tsv | tee -a piped-results.log
+          test -s candidate-streams.tsv || { echo 'No Piped instance returned MP4 streams.' >&2; exit 11; }
+
+      - name: Download candidate 360p/nearby streams
+        shell: bash
+        run: |
+          set +e
+          set +o pipefail
+          UA='TrialObbyCorpusRecovery/1.0 (+https://github.com/1onex/flutter_advanced_calendar/pull/1)'
+          mkdir sources
+          : > downloaded-sources.tsv
+          index=0
+          while IFS=$'\t' read -r api quality codec video_only url; do
+            case "$quality" in
+              240p|360p|480p|720p|360|480|720) ;;
+              *) continue ;;
+            esac
+            index=$((index+1))
+            out="sources/source-$(printf '%02d' "$index")-${quality}-${codec}.mp4"
+            echo "DOWNLOAD $quality $codec videoOnly=$video_only from $api"
+            curl -fL --retry 2 --max-time 1200 -A "$UA" -o "$out" "$url"
+            rc=$?
+            if [ "$rc" -eq 0 ] && [ -f "$out" ] && [ "$(stat -c %s "$out")" -gt 1000000 ]; then
+              printf '%s\t%s\t%s\t%s\t%s\n' "$out" "$api" "$quality" "$codec" "$video_only" >> downloaded-sources.tsv
+            else
+              rm -f "$out"
+            fi
+            [ "$(wc -l < downloaded-sources.tsv)" -ge 8 ] && break
+          done < candidate-streams.tsv
+          cat downloaded-sources.tsv
+          test -s downloaded-sources.tsv || { echo 'Piped returned metadata but no stream could be downloaded.' >&2; exit 12; }
+
+      - name: Probe exact extraction against immutable Git blobs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > expected-early.txt <<'EOF'
+          frame_000001.jpg adfec80dbfc43cef997df5de03b2df6291fec1d4
+          frame_000004.jpg 21e8df3cf8bbf7aa1a951fb0ce2f783284d7e296
+          frame_000022.jpg 358b78975b39cd273abfd30f10a5695ffa84d1dc
+          frame_000040.jpg e21ca7a595a64bb228ab60c237154b6f3483aa03
+          frame_000100.jpg ef63a083343ce009fb982e9e395ccd8c51bd67ad
+          EOF
+          mkdir probes
+          : > probe-results.txt
+          match=''
+          while IFS=$'\t' read -r src api quality codec video_only; do
+            ffprobe -v error -show_streams -show_format "$src" > "${src##*/}.ffprobe.txt" || continue
+            for vf in 'fps=2' 'fps=2,scale=360:640' 'fps=2,scale=360:640:flags=lanczos'; do
+              safe=$(printf '%s-%s' "${src##*/}" "$vf" | tr -cs 'A-Za-z0-9' '_')
+              out="probes/$safe"
+              mkdir -p "$out"
+              ffmpeg -hide_banner -loglevel warning -t 55 -i "$src" -vf "$vf" -start_number 1 "$out/frame_%06d.jpg"
+              ok=1
+              while read -r name expected; do
+                actual=$(git hash-object "$out/$name")
+                echo "$src $vf $name actual=$actual expected=$expected" | tee -a probe-results.txt
+                [ "$actual" = "$expected" ] || ok=0
+              done < expected-early.txt
+              if [ "$ok" -eq 1 ]; then match="$src|$vf"; break 2; fi
+            done
+          done < downloaded-sources.tsv
+          printf '%s\n' "$match" > exact-match.txt
+          test -n "$match" || { echo 'Piped streams downloaded, but none reproduces the immutable Git JPEGs.' >&2; exit 20; }
+
+      - name: Extract and verify full corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          IFS='|' read -r src vf < exact-match.txt
+          mkdir frames
+          ffmpeg -hide_banner -loglevel warning -i "$src" -vf "$vf" -start_number 1 frames/frame_%06d.jpg
+          count=$(find frames -maxdepth 1 -type f -name 'frame_*.jpg' | wc -l)
+          [ "$count" -eq 3484 ] || { echo "Expected 3484 frames, got $count" >&2; exit 21; }
+          cat > expected-full.txt <<'EOF'
           frame_000001.jpg adfec80dbfc43cef997df5de03b2df6291fec1d4
           frame_000004.jpg 21e8df3cf8bbf7aa1a951fb0ce2f783284d7e296
           frame_000022.jpg 358b78975b39cd273abfd30f10a5695ffa84d1dc
@@ -40,23 +160,50 @@ jobs:
           frame_003484.jpg 2297b15b6de24058f3a8c63d655fe7a61b0c6a3c
           EOF
           while read -r name expected; do
-            actual=$(git hash-object "exported-frames/$name")
+            actual=$(git hash-object "frames/$name")
             echo "$name actual=$actual expected=$expected"
-            [ "$actual" = "$expected" ] || exit 33
-          done < expected-git-blobs.txt
-          find exported-frames -maxdepth 1 -type f -name '*.jpg' -print0 | sort -z | xargs -0 sha256sum > frames-sha256.txt
-          du -sh exported-frames | tee corpus-size.txt
+            [ "$actual" = "$expected" ] || exit 22
+          done < expected-full.txt
+          find frames -maxdepth 1 -type f -name '*.jpg' -print0 | sort -z | xargs -0 sha256sum > frames-sha256.txt
+          printf 'source_video=qCxf4NoqXU0\nsource_git_commit=9c62d9489d9f057835f8a62af3a620fa6f4a89a0\nframe_count=%s\nsource_file=%s\nvf=%s\n' "$count" "$src" "$vf" > source.txt
 
-      - name: Upload exact original frame corpus
+      - name: Upload exact corpus
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: trial-obby-3484-original-git-frames
+          name: trial-obby-3484-frames-exact-piped
           compression-level: 0
           retention-days: 7
           if-no-files-found: error
           path: |
-            exported-frames/
+            frames/
             frames-sha256.txt
-            expected-git-blobs.txt
-            private-action-source.txt
-            corpus-size.txt
+            expected-full.txt
+            source.txt
+            ffmpeg-version.txt
+            candidate-streams.tsv
+            downloaded-sources.tsv
+            piped-results.log
+            source-*.ffprobe.txt
+            probe-results.txt
+
+      - name: Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trial-obby-piped-recovery-diagnostics
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            piped-*.json
+            candidate-streams.tsv
+            downloaded-sources.tsv
+            piped-results.log
+            sources/
+            source-*.ffprobe.txt
+            probes/
+            expected-early.txt
+            probe-results.txt
+            exact-match.txt
+            ffmpeg-version.txt
