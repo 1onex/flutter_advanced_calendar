@@ -1,0 +1,62 @@
+name: Temporary private-action frame export
+
+on:
+  push:
+    branches:
+      - agent/trial-obby-frame-export-test
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout staging repository
+        uses: actions/checkout@v4
+
+      - name: Invoke private frame exporter action
+        uses: 1onex/level_reconstruction@agent/frame-corpus-export-20260720
+
+      - name: Verify immutable corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          count=$(find exported-frames -maxdepth 1 -type f -name 'frame_*.jpg' | wc -l)
+          [ "$count" -eq 3484 ] || { echo "Expected 3484 frames, got $count" >&2; exit 32; }
+          cat > expected-git-blobs.txt <<'EOF'
+          frame_000001.jpg adfec80dbfc43cef997df5de03b2df6291fec1d4
+          frame_000004.jpg 21e8df3cf8bbf7aa1a951fb0ce2f783284d7e296
+          frame_000022.jpg 358b78975b39cd273abfd30f10a5695ffa84d1dc
+          frame_000040.jpg e21ca7a595a64bb228ab60c237154b6f3483aa03
+          frame_000100.jpg ef63a083343ce009fb982e9e395ccd8c51bd67ad
+          frame_001000.jpg 470e4d441726615196b08f4fbfe3a03f5a8f79a9
+          frame_002000.jpg ba6879062f85cf2bbcd6fdece8df21f94e5cf1b3
+          frame_003000.jpg 85be8114fa583ac9bdaa6fb3f0ae51b5c78bf097
+          frame_003484.jpg 2297b15b6de24058f3a8c63d655fe7a61b0c6a3c
+          EOF
+          while read -r name expected; do
+            actual=$(git hash-object "exported-frames/$name")
+            echo "$name actual=$actual expected=$expected"
+            [ "$actual" = "$expected" ] || exit 33
+          done < expected-git-blobs.txt
+          find exported-frames -maxdepth 1 -type f -name '*.jpg' -print0 | sort -z | xargs -0 sha256sum > frames-sha256.txt
+          du -sh exported-frames | tee corpus-size.txt
+
+      - name: Upload exact original frame corpus
+        uses: actions/upload-artifact@v4
+        with:
+          name: trial-obby-3484-original-git-frames
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            exported-frames/
+            frames-sha256.txt
+            expected-git-blobs.txt
+            private-action-source.txt
+            corpus-size.txt
