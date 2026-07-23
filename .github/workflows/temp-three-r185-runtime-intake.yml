@@ -8,19 +8,23 @@ on:
       - .ci/three-r185-trigger.txt
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   package:
     runs-on: ubuntu-latest
     steps:
-      - name: Download exact official package
+      - name: Check out intake branch
+        uses: actions/checkout@v4
+        with:
+          ref: temp-three-r185-runtime-intake
+
+      - name: Download and verify exact official package
         shell: bash
         run: |
           set -euo pipefail
           npm pack three@0.185.1 --silent
           test -f three-0.185.1.tgz
-          printf '%s  %s\n' '5aojFCXKwnjBRZvUnt3WFfEcvUJgkN5LlijRFN95hMy8WVkG4I0QNcJE+OuWvuJ0bOdStrbfXn0pkd6/QyiAlg==' 'three-0.185.1.tgz' > expected.sha512.base64
           node - <<'NODE'
           const fs = require('fs');
           const crypto = require('crypto');
@@ -28,14 +32,81 @@ jobs:
           const actual = crypto.createHash('sha512').update(fs.readFileSync(file)).digest('base64');
           const expected = '5aojFCXKwnjBRZvUnt3WFfEcvUJgkN5LlijRFN95hMy8WVkG4I0QNcJE+OuWvuJ0bOdStrbfXn0pkd6/QyiAlg==';
           if (actual !== expected) throw new Error(`SHA-512 mismatch: ${actual}`);
-          fs.writeFileSync('runtime-manifest.json', JSON.stringify({ package: 'three', version: '0.185.1', sha512Base64: actual, bytes: fs.statSync(file).size }, null, 2) + '\n');
           NODE
+
+      - name: Build minimal offline runtime and text chunks
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf runtime-cache/three-r185-min package min-runtime
+          mkdir -p min-runtime/package/build
+          mkdir -p min-runtime/package/examples/jsm/geometries
+          mkdir -p min-runtime/package/examples/jsm/tsl/display
+          tar -xzf three-0.185.1.tgz
+          cp package/package.json min-runtime/package/
+          cp package/LICENSE min-runtime/package/
+          cp package/build/three.core.js min-runtime/package/build/
+          cp package/build/three.webgpu.js min-runtime/package/build/
+          cp package/build/three.tsl.js min-runtime/package/build/
+          cp package/examples/jsm/geometries/RoundedBoxGeometry.js min-runtime/package/examples/jsm/geometries/
+          cp package/examples/jsm/tsl/display/BloomNode.js min-runtime/package/examples/jsm/tsl/display/
+          tar -C min-runtime -czf three-r185-min-runtime.tgz package
+          mkdir -p runtime-cache/three-r185-min
+          base64 -w 76 three-r185-min-runtime.tgz | split -d -a 3 -b 220000 - runtime-cache/three-r185-min/three-r185-min-runtime.tgz.b64.part-
+          SHA256=$(sha256sum three-r185-min-runtime.tgz | awk '{print $1}')
+          SHA512=$(sha512sum three-r185-min-runtime.tgz | awk '{print $1}')
+          BYTES=$(stat -c '%s' three-r185-min-runtime.tgz)
+          PARTS=$(find runtime-cache/three-r185-min -name '*.part-*' | wc -l)
+          cat > runtime-cache/three-r185-min/manifest.json <<EOF
+          {
+            "schema": "three-r185-min-runtime/v1",
+            "package": "three",
+            "version": "0.185.1",
+            "sourceNpmIntegritySha512Base64": "5aojFCXKwnjBRZvUnt3WFfEcvUJgkN5LlijRFN95hMy8WVkG4I0QNcJE+OuWvuJ0bOdStrbfXn0pkd6/QyiAlg==",
+            "archive": "three-r185-min-runtime.tgz",
+            "archiveBytes": ${BYTES},
+            "archiveSha256": "${SHA256}",
+            "archiveSha512": "${SHA512}",
+            "parts": ${PARTS}
+          }
+          EOF
+          cat > runtime-cache/three-r185-min/restore.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          TARGET="${1:-node_modules/three}"
+          TMP="$(mktemp -d)"
+          trap 'rm -rf "$TMP"' EXIT
+          cat "$HERE"/three-r185-min-runtime.tgz.b64.part-* | base64 --decode > "$TMP/three-r185-min-runtime.tgz"
+          EXPECTED="$(node -e "console.log(require('$HERE/manifest.json').archiveSha256)")"
+          ACTUAL="$(sha256sum "$TMP/three-r185-min-runtime.tgz" | awk '{print $1}')"
+          test "$ACTUAL" = "$EXPECTED"
+          mkdir -p "$(dirname "$TARGET")"
+          rm -rf "$TARGET"
+          tar -xzf "$TMP/three-r185-min-runtime.tgz" -C "$TMP"
+          mv "$TMP/package" "$TARGET"
+          node -e "const p=require('./$TARGET/package.json'); if(p.name!=='three'||p.version!=='0.185.1') process.exit(1); console.log('restored three@'+p.version)"
+          EOF
+          chmod +x runtime-cache/three-r185-min/restore.sh
+
+      - name: Commit verified chunks to intake branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add runtime-cache/three-r185-min
+          if git diff --cached --quiet; then
+            echo 'Runtime chunks already current.'
+          else
+            git commit -m 'build: persist verified Three r185 offline runtime chunks'
+            git push origin HEAD:temp-three-r185-runtime-intake
+          fi
+
       - name: Upload exact runtime tarball
         uses: actions/upload-artifact@v4
         with:
           name: three-0.185.1-official
-          path: |
-            three-0.185.1.tgz
-            runtime-manifest.json
+          path: three-0.185.1.tgz
           if-no-files-found: error
           retention-days: 1
