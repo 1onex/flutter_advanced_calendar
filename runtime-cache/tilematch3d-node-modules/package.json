@@ -1,0 +1,23 @@
+{
+  "name": "tilematch3d-runtime-cache",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@react-spring/three": "10.1.2",
+    "@react-three/drei": "10.7.7",
+    "@react-three/fiber": "9.6.1",
+    "@react-three/rapier": "2.2.0",
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "three": "0.182.0",
+    "zustand": "5.0.14"
+  },
+  "devDependencies": {
+    "@types/node": "25.9.5",
+    "@vitejs/plugin-react": "5.2.0",
+    "tsx": "4.23.0",
+    "typescript": "5.9.3",
+    "vite": "7.3.6"
+  }
+}
