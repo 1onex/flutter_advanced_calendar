@@ -1,0 +1,46 @@
+name: Build exact Three r185 probe
+
+on:
+  pull_request:
+    paths:
+      - runtime-cache/tilematch3d-r185-probe/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pack:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.16.0'
+      - name: Pack and verify official package
+        working-directory: runtime-cache/tilematch3d-r185-probe
+        env:
+          npm_config_registry: https://registry.npmjs.org/
+          npm_config_replace_registry_host: always
+          npm_config_audit: 'false'
+          npm_config_fund: 'false'
+        run: |
+          npm pack three@0.185.1 --pack-destination .
+          test -f three-0.185.1.tgz
+          ACTUAL=$(openssl dgst -sha512 -binary three-0.185.1.tgz | base64 -w0)
+          EXPECTED='5aojFCXKwnjBRZvUnt3WFfEcvUJgkN5LlijRFN95hMy8WVkG4I0QNcJE+OuWvuJ0bOdStrbfXn0pkd6/QyiAlg=='
+          test "$ACTUAL" = "$EXPECTED"
+          mkdir verify
+          tar -xzf three-0.185.1.tgz -C verify --strip-components=1
+          node -e "const p=require('./verify/package.json'); if(p.name!=='three'||p.version!=='0.185.1') process.exit(1)"
+          sha256sum three-0.185.1.tgz > THREE_R185_SHA256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: three-0.185.1-official
+          path: |
+            runtime-cache/tilematch3d-r185-probe/three-0.185.1.tgz
+            runtime-cache/tilematch3d-r185-probe/THREE_R185_SHA256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
