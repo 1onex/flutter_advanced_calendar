@@ -67,6 +67,15 @@ jobs:
           console.log(`verified three revision ${three.REVISION}`);
           NODE
 
+      - name: Vendor exact Sakura forest environment
+        working-directory: runtime-cache/tilematch3d-node-modules
+        run: |
+          curl --fail --location --retry 3 \
+            --output forest_slope_1k.hdr \
+            https://raw.githubusercontent.com/pmndrs/drei-assets/456060a26bbeb8fdf79326f224b6d99b8bcce736/hdri/forest_slope_1k.hdr
+          test "$(stat -c %s forest_slope_1k.hdr)" -eq 1911073
+          sha256sum forest_slope_1k.hdr > FOREST_HDR_SHA256
+
       - name: Build deterministic runtime archive
         working-directory: runtime-cache/tilematch3d-node-modules
         run: |
@@ -83,10 +92,11 @@ jobs:
             "three": "0.182.0",
             "archive": "tilematch3d-node-modules-linux-x64.tgz",
             "archiveBytes": ${BYTES},
-            "archiveSha256": "${SHA256}"
+            "archiveSha256": "${SHA256}",
+            "forestEnvironment": "forest_slope_1k.hdr"
           }
           JSON
-          sha256sum tilematch3d-node-modules-linux-x64.tgz package-lock.json > SHA256SUMS
+          sha256sum tilematch3d-node-modules-linux-x64.tgz package-lock.json forest_slope_1k.hdr > SHA256SUMS
 
       - uses: actions/upload-artifact@v4
         with:
@@ -96,6 +106,8 @@ jobs:
             runtime-cache/tilematch3d-node-modules/runtime-manifest.json
             runtime-cache/tilematch3d-node-modules/SHA256SUMS
             runtime-cache/tilematch3d-node-modules/package-lock.json
+            runtime-cache/tilematch3d-node-modules/forest_slope_1k.hdr
+            runtime-cache/tilematch3d-node-modules/FOREST_HDR_SHA256
           if-no-files-found: error
           compression-level: 0
           retention-days: 90
