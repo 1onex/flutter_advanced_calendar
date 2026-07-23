@@ -1,0 +1,103 @@
+name: Build TileMatch3D offline runtime
+
+on:
+  push:
+    branches:
+      - temp-tilematch3d-runtime-intake
+    paths:
+      - runtime-cache/tilematch3d-node-modules/package.json
+      - .github/workflows/tilematch3d-runtime-cache.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-runtime:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.16.0'
+
+      - name: Install exact launch dependencies
+        working-directory: runtime-cache/tilematch3d-node-modules
+        env:
+          npm_config_registry: https://registry.npmjs.org/
+          npm_config_replace_registry_host: always
+          npm_config_audit: 'false'
+          npm_config_fund: 'false'
+        run: npm install --install-strategy=hoisted --package-lock=true
+
+      - name: Verify Three.js and application runtime
+        working-directory: runtime-cache/tilematch3d-node-modules
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFile, stat } from 'node:fs/promises';
+          const expected = {
+            '@react-spring/three': '10.1.2',
+            '@react-three/drei': '10.7.7',
+            '@react-three/fiber': '9.6.1',
+            '@react-three/rapier': '2.2.0',
+            react: '19.2.7',
+            'react-dom': '19.2.7',
+            three: '0.182.0',
+            zustand: '5.0.14',
+            vite: '7.3.6',
+            typescript: '5.9.3',
+            tsx: '4.23.0'
+          };
+          for (const [name, version] of Object.entries(expected)) {
+            const pkg = JSON.parse(await readFile(`node_modules/${name}/package.json`, 'utf8'));
+            if (pkg.version !== version) throw new Error(`${name}: expected ${version}, got ${pkg.version}`);
+          }
+          for (const file of [
+            'node_modules/three/build/three.core.js',
+            'node_modules/three/build/three.module.js',
+            'node_modules/three/build/three.webgpu.js',
+            'node_modules/three/build/three.tsl.js'
+          ]) {
+            if (!(await stat(file)).isFile()) throw new Error(`Missing ${file}`);
+          }
+          const three = await import('three');
+          if (!three.WebGLRenderer || !three.Mesh || !three.Scene) throw new Error('Three.js ESM import incomplete');
+          await import('@react-three/fiber');
+          await import('@react-three/drei');
+          console.log(`verified three revision ${three.REVISION}`);
+          NODE
+
+      - name: Build deterministic runtime archive
+        working-directory: runtime-cache/tilematch3d-node-modules
+        run: |
+          tar --sort=name --mtime='UTC 2026-01-01' --owner=0 --group=0 --numeric-owner \
+            -czf tilematch3d-node-modules-linux-x64.tgz \
+            node_modules package.json package-lock.json
+          SHA256=$(sha256sum tilematch3d-node-modules-linux-x64.tgz | awk '{print $1}')
+          BYTES=$(stat -c %s tilematch3d-node-modules-linux-x64.tgz)
+          cat > runtime-manifest.json <<JSON
+          {
+            "schema": "tilematch3d-offline-node-modules/v1",
+            "platform": "linux-x64",
+            "node": "22.16.0",
+            "three": "0.182.0",
+            "archive": "tilematch3d-node-modules-linux-x64.tgz",
+            "archiveBytes": ${BYTES},
+            "archiveSha256": "${SHA256}"
+          }
+          JSON
+          sha256sum tilematch3d-node-modules-linux-x64.tgz package-lock.json > SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tilematch3d-offline-node-modules-linux-x64
+          path: |
+            runtime-cache/tilematch3d-node-modules/tilematch3d-node-modules-linux-x64.tgz
+            runtime-cache/tilematch3d-node-modules/runtime-manifest.json
+            runtime-cache/tilematch3d-node-modules/SHA256SUMS
+            runtime-cache/tilematch3d-node-modules/package-lock.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90
