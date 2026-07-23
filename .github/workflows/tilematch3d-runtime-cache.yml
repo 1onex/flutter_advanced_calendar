@@ -7,6 +7,9 @@ on:
     paths:
       - runtime-cache/tilematch3d-node-modules/package.json
       - .github/workflows/tilematch3d-runtime-cache.yml
+  pull_request:
+    branches:
+      - temp-tilematch3d-runtime-intake
   workflow_dispatch:
 
 permissions:
