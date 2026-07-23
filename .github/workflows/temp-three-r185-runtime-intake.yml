@@ -1,0 +1,41 @@
+name: Temporary Three r185 Runtime Intake
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - .github/workflows/temp-three-r185-runtime-intake.yml
+      - .ci/three-r185-trigger.txt
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download exact official package
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm pack three@0.185.1 --silent
+          test -f three-0.185.1.tgz
+          printf '%s  %s\n' '5aojFCXKwnjBRZvUnt3WFfEcvUJgkN5LlijRFN95hMy8WVkG4I0QNcJE+OuWvuJ0bOdStrbfXn0pkd6/QyiAlg==' 'three-0.185.1.tgz' > expected.sha512.base64
+          node - <<'NODE'
+          const fs = require('fs');
+          const crypto = require('crypto');
+          const file = 'three-0.185.1.tgz';
+          const actual = crypto.createHash('sha512').update(fs.readFileSync(file)).digest('base64');
+          const expected = '5aojFCXKwnjBRZvUnt3WFfEcvUJgkN5LlijRFN95hMy8WVkG4I0QNcJE+OuWvuJ0bOdStrbfXn0pkd6/QyiAlg==';
+          if (actual !== expected) throw new Error(`SHA-512 mismatch: ${actual}`);
+          fs.writeFileSync('runtime-manifest.json', JSON.stringify({ package: 'three', version: '0.185.1', sha512Base64: actual, bytes: fs.statSync(file).size }, null, 2) + '\n');
+          NODE
+      - name: Upload exact runtime tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: three-0.185.1-official
+          path: |
+            three-0.185.1.tgz
+            runtime-manifest.json
+          if-no-files-found: error
+          retention-days: 1
