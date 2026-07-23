@@ -1,0 +1,11 @@
+{
+  "schema": "three-r185-min-runtime/v1",
+  "package": "three",
+  "version": "0.185.1",
+  "sourceNpmIntegritySha512Base64": "5aojFCXKwnjBRZvUnt3WFfEcvUJgkN5LlijRFN95hMy8WVkG4I0QNcJE+OuWvuJ0bOdStrbfXn0pkd6/QyiAlg==",
+  "archive": "three-r185-min-runtime.tgz",
+  "archiveBytes": 725078,
+  "archiveSha256": "e6c3ecd73c5380e2b817a63bd5de9b3f8fac5ed456d47c4ff4be67f44c954b1b",
+  "archiveSha512": "cca67b1c9ff08f698271eb1739165520f1b40acf2760fe2c5aff32bd863610752c5aacd4cce5537d71085b54eeda0e39fb686ceed1d03f32938ca890efed4e99",
+  "parts": 5
+}
